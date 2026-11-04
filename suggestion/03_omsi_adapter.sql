@@ -144,55 +144,9 @@ CREATE OR ALTER PROCEDURE omsi_adp.usp_DispatchOutbound
 AS
 BEGIN
     SET NOCOUNT ON;
-    DECLARE @RunId bigint, @Owner nvarchar(128), @Batch int = 0, @Got int = 1;
-    DECLARE @Items TABLE (WorkItemId bigint, OperationCode int, OperationName varchar(60), TargetSystem varchar(20),
-                          AdapterProcedure sysname NULL, OrderingKey nvarchar(100), IdempotencyKey nvarchar(200),
-                          AttemptCount int, PayloadJson nvarchar(max), CorrelationId uniqueidentifier NULL,
-                          EntityType varchar(30) NULL, SourceKey nvarchar(100) NULL);
-
-    EXEC integ.usp_Run_Start @ProcessName, @RunId OUTPUT;
-    SET @Owner = CONCAT(@ProcessName, N'#', @RunId);
-
-    BEGIN TRY
-        WHILE @Got > 0 AND @Batch < @MaxBatches
-        BEGIN
-            DELETE @Items;
-            INSERT @Items EXEC integ.usp_WorkItem_Claim @RunId = @RunId, @LeaseOwner = @Owner,
-                                                        @BatchSize = @BatchSize, @TargetSystem = 'OMSI';
-            SET @Got = @@ROWCOUNT; SET @Batch += 1;
-
-            DECLARE @Id bigint, @Proc sysname;
-            DECLARE cur CURSOR LOCAL FAST_FORWARD FOR SELECT WorkItemId, AdapterProcedure FROM @Items ORDER BY WorkItemId;
-            OPEN cur; FETCH NEXT FROM cur INTO @Id, @Proc;
-            WHILE @@FETCH_STATUS = 0
-            BEGIN
-                -- Per-item isolation: errors the adapter cannot catch in its own scope
-                -- (e.g. 208 missing object, 2812 missing procedure, 266 tran-count mismatch)
-                -- are caught here, recorded against THIS item only, and the loop continues.
-                BEGIN TRY
-                    IF @Proc IS NULL
-                        EXEC integ.usp_WorkItem_Fail @Id, @Owner, NULL, N'Contract: no adapter procedure configured for operation.', @ErrorClass = 'Contract';
-                    ELSE
-                        EXEC @Proc @WorkItemId = @Id, @LeaseOwner = @Owner;
-                END TRY
-                BEGIN CATCH
-                    IF @@TRANCOUNT > 0 ROLLBACK;
-                    DECLARE @ien int = ERROR_NUMBER(), @iem nvarchar(4000) = ERROR_MESSAGE(),
-                            @iep nvarchar(128) = ERROR_PROCEDURE(), @iel int = ERROR_LINE();
-                    EXEC integ.usp_WorkItem_Fail @WorkItemId = @Id, @LeaseOwner = @Owner,
-                         @ErrorNumber = @ien, @ErrorMessage = @iem, @ErrorProcedure = @iep, @ErrorLine = @iel;
-                END CATCH;
-                FETCH NEXT FROM cur INTO @Id, @Proc;
-            END;
-            CLOSE cur; DEALLOCATE cur;
-        END;
-        EXEC integ.usp_Run_End @RunId, 'Succeeded';
-    END TRY
-    BEGIN CATCH
-        DECLARE @msg nvarchar(4000) = ERROR_MESSAGE();
-        EXEC integ.usp_Run_End @RunId, 'Failed', @msg;
-        THROW;
-    END CATCH;
+    -- Thin wrapper: the claim/adapter/fail loop is the reusable integ.usp_Dispatch
+    EXEC integ.usp_Dispatch @TargetSystem = 'OMSI', @ProcessName = @ProcessName,
+                            @BatchSize = @BatchSize, @MaxBatches = @MaxBatches;
 END;
 GO
 
