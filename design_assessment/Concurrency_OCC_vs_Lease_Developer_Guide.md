@@ -70,7 +70,7 @@ The defect this prevents is **two workers doing the same task** and **a task bei
 |---|---|
 | OCC for dispatch | Both workers perform the side effect (HTTP call, OMSI insert); OCC only detects the race **after** the effect. With an external target, the duplicate has already happened. |
 | A pessimistic SQL lock held for the whole dispatch | A slow HTTP call holds row/page locks for minutes, blocks other claimers (no `READPAST` benefit for already-locked rows that later need FIFO checks), and a hung client keeps the lock until the connection dies. |
-| Leases for entity edits | A user who opens a screen would "lease" the entity. If they walk away, every publish for that shipment blocks until expiry, and you need renewal for a human. Leases are a poor fit for think-time. |
+| Leases for entity edits **[poor]** | A user who opens a screen would "lease" the entity. If they walk away, every publish for that shipment blocks until expiry, and you need renewal for a human. **Leases are a poor fit for think-time.** |
 
 ---
 
