@@ -251,7 +251,8 @@ CREATE TABLE integ.WorkItem (
         CONSTRAINT CK_WI_Status CHECK (Status IN
             ('Pending','Leased','RetryWait','Dispatched','Succeeded','DeadLetter','Superseded','Cancelled')),
     StatusReason      nvarchar(400) NULL,
-    AttemptCount      int           NOT NULL CONSTRAINT DF_WI_Att DEFAULT (0),
+    AttemptCount      int           NOT NULL CONSTRAINT DF_WI_Att DEFAULT (0),          -- lifetime attempts (history)
+    RetryBudgetBase   int           NOT NULL CONSTRAINT DF_WI_Budget DEFAULT (0),       -- AttemptCount at last manual Retry
     NextAttemptAt     datetime2(3)  NOT NULL CONSTRAINT DF_WI_Next DEFAULT (SYSDATETIME()),
     LeaseOwner        nvarchar(128) NULL,
     LeaseExpiresAt    datetime2(3)  NULL,
