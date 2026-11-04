@@ -383,13 +383,14 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
     DECLARE @Now datetime2(3) = SYSDATETIME();
-    DECLARE @Op int, @Attempts int, @CatalogId int, @IsRetryable bit = 1,
+    DECLARE @Op int, @Attempts int, @BudgetAttempts int, @CatalogId int, @IsRetryable bit = 1,
             @MaxAttempts int, @Base int, @Factor decimal(4,2), @MaxDelay int, @Delay int,
             @NewStatus varchar(12), @Ret int, @Key nvarchar(100);
 
     SET @ErrorMessage = COALESCE(@ErrorMessage, N'(no error message supplied)');
 
-    SELECT @Op = OperationCode, @Attempts = AttemptCount, @Key = OrderingKey
+    -- @Attempts = lifetime (reported); @BudgetAttempts = attempts since the last manual Retry (drives the policy)
+    SELECT @Op = OperationCode, @Attempts = AttemptCount, @BudgetAttempts = AttemptCount - RetryBudgetBase, @Key = OrderingKey
       FROM integ.WorkItem WHERE WorkItemId = @WorkItemId AND Status = 'Leased' AND LeaseOwner = @LeaseOwner;
     IF @Op IS NULL RETURN -1;
     DECLARE @RunId bigint = (SELECT RunId FROM integ.WorkItemAttempt WHERE WorkItemId = @WorkItemId AND EndedAt IS NULL);
@@ -410,10 +411,10 @@ BEGIN
 
     IF @ErrorClass = 'Duplicate'
         SELECT @NewStatus = 'Succeeded', @Ret = 2;      -- target already has it: idempotent replay
-    ELSE IF @IsRetryable = 1 AND @Attempts < COALESCE(@MaxAttempts, 0)
+    ELSE IF @IsRetryable = 1 AND @BudgetAttempts < COALESCE(@MaxAttempts, 0)
     BEGIN
         -- exponential backoff with up to 10% jitter to avoid retry storms
-        SET @Delay = CAST(@Base * POWER(CAST(@Factor AS float), @Attempts - 1) AS int);
+        SET @Delay = CAST(@Base * POWER(CAST(@Factor AS float), @BudgetAttempts - 1) AS int);
         SET @Delay = IIF(@Delay > @MaxDelay OR @Delay < 0, @MaxDelay, @Delay);
         SET @Delay += ABS(CHECKSUM(NEWID())) % (@Delay / 10 + 1);
         SELECT @NewStatus = 'RetryWait', @Ret = 0;
@@ -468,8 +469,10 @@ AS
 BEGIN
     SET NOCOUNT ON; SET XACT_ABORT ON;
     BEGIN TRANSACTION;
+    -- Fresh retry budget: the policy counts attempts from here; AttemptCount keeps the lifetime total
     UPDATE integ.WorkItem
-       SET Status = 'Pending', NextAttemptAt = SYSDATETIME(), StatusReason = CONCAT('Manual retry: ', @Reason)
+       SET Status = 'Pending', NextAttemptAt = SYSDATETIME(), RetryBudgetBase = AttemptCount,
+           StatusReason = CONCAT('Manual retry: ', @Reason)
      WHERE WorkItemId = @WorkItemId AND Status IN ('DeadLetter','RetryWait');
     IF @@ROWCOUNT = 0 THROW 52010, 'Only DeadLetter or RetryWait work items can be retried.', 1;
     INSERT integ.OperatorAction (WorkItemId, Action, Reason) VALUES (@WorkItemId, 'Retry', @Reason);
@@ -512,5 +515,94 @@ BEGIN
     SET @NewWorkItemId = SCOPE_IDENTITY();
     INSERT integ.OperatorAction (WorkItemId, Action, Reason, ResultWorkItemId) VALUES (@WorkItemId, 'Replay', @Reason, @NewWorkItemId);
     COMMIT;
+END;
+GO
+
+/* ---------------------------------------------------------------------
+   RENEW LEASE (heartbeat) - for workers whose step can outlast the lease
+   (slow HTTP call, large file). Fenced: only the current owner can extend.
+   Call BEFORE the lease expires; on THROW 52002 stop work on the item.
+   --------------------------------------------------------------------- */
+CREATE OR ALTER PROCEDURE integ.usp_WorkItem_RenewLease
+    @WorkItemId bigint, @LeaseOwner nvarchar(128), @LeaseSeconds int = 300
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @Now datetime2(3) = SYSDATETIME();
+    UPDATE integ.WorkItem
+       SET LeaseExpiresAt = DATEADD(SECOND, @LeaseSeconds, @Now)
+     WHERE WorkItemId = @WorkItemId AND Status = 'Leased' AND LeaseOwner = @LeaseOwner
+       AND LeaseExpiresAt > @Now;                -- an expired lease may already be reclaimed: never resurrect it
+    IF @@ROWCOUNT = 0
+        THROW 52002, 'Lease lost or expired: stop processing this work item.', 1;
+    UPDATE r SET HeartbeatAt = @Now
+      FROM integ.ProcessRun r
+      JOIN integ.WorkItemAttempt a ON a.RunId = r.RunId
+     WHERE a.WorkItemId = @WorkItemId AND a.EndedAt IS NULL;
+END;
+GO
+
+/* ---------------------------------------------------------------------
+   GENERIC DISPATCHER for SQL-adapter targets (any TargetSystem).
+   Loop: claim -> EXEC OperationCatalog.AdapterProcedure per item.
+   Adapter contract: @WorkItemId bigint, @LeaseOwner nvarchar(128); it must
+   call usp_WorkItem_Complete on success and usp_WorkItem_Fail on failure.
+   Per-item TRY/CATCH: one item's failure never stops the batch.
+   --------------------------------------------------------------------- */
+CREATE OR ALTER PROCEDURE integ.usp_Dispatch
+    @TargetSystem varchar(20), @ProcessName nvarchar(128), @BatchSize int = 50, @MaxBatches int = 20,
+    @LeaseSeconds int = 300, @OperationCode int = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @RunId bigint, @Owner nvarchar(128), @Batch int = 0, @Got int = 1;
+    DECLARE @Items TABLE (WorkItemId bigint, OperationCode int, OperationName varchar(60), TargetSystem varchar(20),
+                          AdapterProcedure sysname NULL, OrderingKey nvarchar(100), IdempotencyKey nvarchar(200),
+                          AttemptCount int, PayloadJson nvarchar(max), CorrelationId uniqueidentifier NULL,
+                          EntityType varchar(30) NULL, SourceKey nvarchar(100) NULL);
+
+    EXEC integ.usp_Run_Start @ProcessName, @RunId OUTPUT;
+    SET @Owner = CONCAT(@ProcessName, N'#', @RunId);
+
+    BEGIN TRY
+        WHILE @Got > 0 AND @Batch < @MaxBatches
+        BEGIN
+            DELETE @Items;
+            INSERT @Items EXEC integ.usp_WorkItem_Claim @RunId = @RunId, @LeaseOwner = @Owner, @BatchSize = @BatchSize,
+                                                        @LeaseSeconds = @LeaseSeconds, @TargetSystem = @TargetSystem,
+                                                        @OperationCode = @OperationCode;
+            SET @Got = @@ROWCOUNT; SET @Batch += 1;
+
+            DECLARE @Id bigint, @Proc sysname;
+            DECLARE cur CURSOR LOCAL FAST_FORWARD FOR SELECT WorkItemId, AdapterProcedure FROM @Items ORDER BY WorkItemId;
+            OPEN cur; FETCH NEXT FROM cur INTO @Id, @Proc;
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                -- Errors the adapter cannot catch in its own scope (208 missing object, 2812 missing
+                -- procedure, 266 tran-count mismatch) are recorded against THIS item only.
+                BEGIN TRY
+                    IF @Proc IS NULL
+                        EXEC integ.usp_WorkItem_Fail @Id, @Owner, NULL, N'Contract: no adapter procedure configured for operation.', @ErrorClass = 'Contract';
+                    ELSE
+                        EXEC @Proc @WorkItemId = @Id, @LeaseOwner = @Owner;
+                END TRY
+                BEGIN CATCH
+                    IF @@TRANCOUNT > 0 ROLLBACK;
+                    DECLARE @ien int = ERROR_NUMBER(), @iem nvarchar(4000) = ERROR_MESSAGE(),
+                            @iep nvarchar(128) = ERROR_PROCEDURE(), @iel int = ERROR_LINE();
+                    EXEC integ.usp_WorkItem_Fail @WorkItemId = @Id, @LeaseOwner = @Owner,
+                         @ErrorNumber = @ien, @ErrorMessage = @iem, @ErrorProcedure = @iep, @ErrorLine = @iel;
+                END CATCH;
+                FETCH NEXT FROM cur INTO @Id, @Proc;
+            END;
+            CLOSE cur; DEALLOCATE cur;
+        END;
+        EXEC integ.usp_Run_End @RunId, 'Succeeded';
+    END TRY
+    BEGIN CATCH
+        DECLARE @msg nvarchar(4000) = ERROR_MESSAGE();
+        EXEC integ.usp_Run_End @RunId, 'Failed', @msg;
+        THROW;
+    END CATCH;
 END;
 GO
