@@ -22,7 +22,7 @@ The ledger uses two different concurrency mechanisms. They solve **different pro
 | Physical SQL locks held | Only for the single write statement (milliseconds) | Only for the claim statement (milliseconds) |
 | Logical "lock" held | None | A **lease** stored as data: `LeaseOwner`, `LeaseExpiresAt` (minutes) |
 | Behaviour if the actor crashes | Nothing to clean up: no lock was held | The lease **expires** and the item is reclaimed; the dead attempt is closed as `Abandoned` |
-| Loser of a race | Gets a conflict error, reloads, re-decides **[re-try counts]** | Never sees the item (skipped), or is **fenced** (`52001`, `52002`, `-1`) |
+| Loser of a race | Gets a conflict error, reloads, re-decides **[remember: re-try counts]** | Never sees the item (skipped), or is **fenced** (`52001`, `52002`, `-1`) |
 | Typical token | `rowversion` / integer `Version` / producer revision | `LeaseOwner` (+ `LeaseExpiresAt`, + `AttemptNo`) |
 | Liveness | Lock-free; a writer can starve only under heavy contention | Bounded by lease length; a crash delays work by up to one lease + one schedule interval |
 
