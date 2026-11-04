@@ -193,7 +193,9 @@ sequenceDiagram
 
 ## 5. Area 2 — Integration service as a *data model* (work-item ledger)
 
-Your preference fits this design: **the ledger is the service contract**. Any process (SSIS today, a .NET worker or Azure Function tomorrow) can pick up work using four procedures. The processing logic is stateless; all state is in the tables.
+Your preference fits this design: **the ledger is the service contract**. Any process (SSIS today, a .NET worker or Azure Function tomorrow) can pick up work using a handful of procedures. The processing logic is stateless; all state is in the tables.
+
+> **Developers:** the full internal logic is in [WorkItem_Ledger_Developer_Guide.md](./WorkItem_Ledger_Developer_Guide.md). It covers the transition table with guards, invariants, lock-hint rationale, lease and fencing timeline, backoff math, worker contracts, a reuse checklist and an adapter template. This section is the summary.
 
 ### 5.1 Work-item state machine
 
@@ -202,17 +204,20 @@ stateDiagram-v2
   [*] --> Pending : published / replayed / manual retry
   Pending --> Leased : claim
   RetryWait --> Leased : claim (NextAttemptAt reached)
-  Leased --> Leased : lease expired, reclaimed (attempt = Abandoned)
+  Leased --> Leased : lease renewed by owner / expired and reclaimed (attempt = Abandoned)
   Leased --> Dispatched : complete (async target: OMSI)
   Leased --> Succeeded : complete (sync target: API) / Duplicate error
-  Leased --> RetryWait : fail, retryable, attempts left (backoff)
-  Leased --> DeadLetter : fail, non-retryable or exhausted
+  Leased --> RetryWait : fail, retryable, budget left (backoff)
+  Leased --> DeadLetter : fail, non-retryable or budget exhausted
   Dispatched --> Succeeded : OMSI ack (result_code = 0)
   Dispatched --> DeadLetter : OMSI rejection
   Pending --> Superseded : newer revision / cancel
   RetryWait --> Superseded
   DeadLetter --> Superseded : cancel / newer snapshot revision
-  DeadLetter --> Pending : operator Retry
+  DeadLetter --> Pending : operator Retry (fresh budget)
+  RetryWait --> Pending : operator Retry
+  Pending --> Cancelled : operator Cancel
+  RetryWait --> Cancelled : operator Cancel
   DeadLetter --> Cancelled : operator Cancel
   Succeeded --> [*]
 ```
@@ -226,6 +231,8 @@ stateDiagram-v2
 - The claim returns the payload, the idempotency key and the adapter procedure name. The worker needs nothing else.
 
 **Fencing.** `usp_WorkItem_Complete` succeeds only if the caller still holds the lease (otherwise it throws `52001 Lease lost`), so a slow, reclaimed worker cannot overwrite a newer outcome.
+
+**Lease renewal.** Workers whose step can outlast the lease (slow HTTP calls) call `usp_WorkItem_RenewLease` at about half the lease interval. It refuses (`52002`) once the lease has expired, so a lost lease is never resurrected.
 
 ### 5.3 Failure handling (`usp_WorkItem_Fail`)
 
@@ -242,7 +249,7 @@ stateDiagram-v2
 
 | Action | Allowed from | Effect | Typical use |
 |---|---|---|---|
-| `usp_WorkItem_Retry` | `DeadLetter`, `RetryWait` | Back to `Pending` now, same idempotency key | Mapping added, data fixed, API back up |
+| `usp_WorkItem_Retry` | `DeadLetter`, `RetryWait` | Back to `Pending` now, same idempotency key, **fresh retry budget** (`RetryBudgetBase = AttemptCount`; lifetime `AttemptCount` is kept) | Mapping added, data fixed, API back up |
 | `usp_WorkItem_Cancel` | `Pending`, `RetryWait`, `DeadLetter` | `Cancelled`; unblocks followers | Obsolete message |
 | `usp_WorkItem_Replay` | `Succeeded`, `Dispatched`, `Cancelled`, `Superseded` | **New** work item linked by `ParentWorkItemId`, new key `…\|R1` | TMS lost a load; resend deliberately |
 
@@ -261,9 +268,9 @@ Retry and Replay are deliberately different: *Retry* is "try the same thing agai
 
 ### 5.6 How SSIS uses the ledger (contract for developers)
 
-**OMSI target.** One SQL task: `EXEC omsi_adp.usp_DispatchOutbound`. It loops claim → adapter → complete/fail and records a `ProcessRun`.
+**OMSI target.** One SQL task: `EXEC omsi_adp.usp_DispatchOutbound`. It's a thin wrapper over the generic `integ.usp_Dispatch @TargetSystem = 'OMSI'`, which loops claim → adapter → complete/fail and records a `ProcessRun`. Any other same-instance SQL target reuses `integ.usp_Dispatch` with its own adapter ([templates/usp_Adapter_Template.sql](./templates/usp_Adapter_Template.sql)).
 
-**ERP API target.** The SSIS package does the HTTP call:
+**ERP API target.** The SSIS package does the HTTP call (renewing the lease if the call can be slow):
 ```
 RunId = usp_Run_Start('SSIS.LtApi')
 loop:
@@ -709,7 +716,7 @@ flowchart LR
 | 9 | 🟠 | **Vendor connector isolation level and triggers unknown** | Our `is_ready=0` → payload → ledger → `is_ready=1` order (now the last statement before commit) is safe for READ COMMITTED and nearly so for NOLOCK readers. Vendor-side triggers or RCSI could change behaviour. | Confirm with the vendor; test against a vendor-provided OMSI instance. |
 | 10 | 🟠 | **Foreign-key scans on vendor tables under concurrency** | Reproduced: deadlocks on `PK_OPERATION` when FK validation scans. Fixed in the adapter; any new adapter (5800, 7500) must follow the same rule. | Single-row `VALUES` for headers and `OPTION (LOOP JOIN)` for child inserts; parallel-dispatch test for every new adapter. |
 | 11 | 🟠 | **Cross-stream blocking per shipment** | A dead-lettered freight payment (Event) also holds back shipment modifies for that shipment. | Separate ordering streams: `OrderingKey = Shipment:<n>:<stream>` (Snapshot vs Financial). |
-| 12 | 🟠 | **Lease shorter than a slow API call** | A 300-second lease can expire during a slow HTTP call; the item is reclaimed and called twice. That's safe only with #5. | Lease longer than the API timeout, or a lease-renewal heartbeat procedure. |
+| 12 | 🟠 | **Lease shorter than a slow API call** | A 300-second lease can expire during a slow HTTP call; the item is reclaimed and called twice. That's safe only with #5. | **Mechanism added:** `integ.usp_WorkItem_RenewLease` (fenced; tested). Remaining action: external workers must call it at about half the lease interval. |
 | 13 | 🟠 | **Dual running during migration** | Legacy procedures and the new adapter both sending the same operation would create duplicate OMSI operations. | Cut over one operation type at a time; disable the legacy path for that type in the same release (§9). |
 | 14 | 🟠 | **Order revisions fan out** | One `ord_rev` change can affect several shipments (via `shp_ord`), and one shipment can have several orders. | The detector must publish one snapshot per affected shipment, using the newest revision across `shp_rev` and `ord_rev`. |
 | 15 | 🟠 | **Payload snapshots retain contact data** | `PayloadJson` and `RequestSnapshot` hold names, phones and emails for the retention period. | Mask in snapshots where not needed; restrict `SELECT` on ledger tables; align retention with privacy policy. |
