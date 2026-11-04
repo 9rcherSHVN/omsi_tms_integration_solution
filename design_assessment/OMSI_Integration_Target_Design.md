@@ -196,7 +196,7 @@ sequenceDiagram
 Your preference fits this design: **the ledger is the service contract**. Any process (SSIS today, a .NET worker or Azure Function tomorrow) can pick up work using a handful of procedures. The processing logic is stateless; all state is in the tables.
 
 > **Developers:** the full internal logic is in [WorkItem_Ledger_Developer_Guide.md](./WorkItem_Ledger_Developer_Guide.md). It covers the transition table with guards, invariants, lock-hint rationale, lease and fencing timeline, backoff math, worker contracts, a reuse checklist and an adapter template. This section is the summary.
-
+> For when to use entity optimistic concurrency (OCC versioning) versus work-item leases, and the trade-offs of each, see [Concurrency_OCC_vs_Lease_Developer_Guide.md](./Concurrency_OCC_vs_Lease_Developer_Guide.md).
 ### 5.1 Work-item state machine
 
 ```mermaid
